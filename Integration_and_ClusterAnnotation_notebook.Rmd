@@ -1,0 +1,818 @@
+---
+title: "R notebook: Integration and Cluster Annotation Comparison"
+output: html_notebook
+---
+NB: the data and workflow are adapted from Dr. Rhalena Thomas's AST23_160MBO_analysis_workbook
+
+scRNAseq data from 160 days-old MBOs from AST23 and AST23 isogenic control groups.
+Organoids were grown in shaking cultures, dissocation was performed manually and with TryPLE. The live cells were sorted by FACS and 3000 cells were targeted for sequencing. Each dissociation was a pool of three MBOs.
+Each lane in 10X controler was loaded with a genotype.
+
+
+This notebook contains:
+- Setting up the data object, QC, and filtering 
+- Merging and integrating the two samples
+- Clustering 
+- Examining different cluster annotation methods 
+- Exploring expression in clusters and finding cluster markers in Seurat
+- Final cluster annotation
+
+          
+Prepare the work space
+
+```{r}
+
+# Clear workspace 
+
+rm(list=ls())
+
+# Load libraries
+
+library("ggplot2")
+library("Seurat")
+library("cowplot")
+library("clustree")
+library(patchwork)
+library(dplyr)
+library("Matrix")
+library("SingleCellExperiment")
+```
+
+
+Read in the raw data from CellRanger and create the Seurat objects
+
+    Read10X() function reads in the output of the cellranger pipeline from 10X, returning a UMI count matrix. The values in this count matrix represent the number of molecules for each feature (i.e. gene; row) that are detected in each cell (column).
+    
+    Seurat object serves as a container that contains both data (like the count matrix) and analysis (like PCA, or clustering results) for a single-cell dataset. 
+
+```{r}
+
+# Setup directory pathway for AST23 and AST23_isogenic
+
+AST23_pathway <- "../anelya/Desktop/AST23_isogenic_BrainComm/AST23/raw_feature_bc_matrix/"
+
+AST23_isogenic_pathway <- "../anelya/Desktop/AST23_isogenic_BrainComm/AST23isogenic/raw_feature_bc_matrix/"
+
+# Load sparse matrix data from 10X for AST23 and AST23_isogenic
+
+AST23.data <- Read10X(data.dir = AST23_pathway)
+
+AST23iso.data <- Read10X(data.dir = AST23_isogenic_pathway)
+
+# Initialize the Seurat object with the raw data
+
+AST23 <- CreateSeuratObject(counts = AST23.data, project = "AST23")
+AST23
+
+AST23iso <- CreateSeuratObject(counts = AST23iso.data, project = "Isogenic")
+AST23iso
+```
+
+Filtering 
+
+Filter for cells with at least 500 genes and less than 20% mitochondrial RNA
+Filter conditions were previously compared and optimal filters are selected here.
+```{r}
+
+# Select for cells with at least 500 genes
+
+AST23 <- subset(AST23, subset = nFeature_RNA > 500) 
+AST23
+
+AST23iso <- subset(AST23iso, subset = nFeature_RNA > 500) 
+AST23iso
+
+# Filter for cells with less than 20% mitochondrial RNA
+
+AST23[["percent.mt"]] <- PercentageFeatureSet(AST23, pattern = "^MT-")
+AST23 <- subset(AST23, subset = percent.mt < 20)    
+
+AST23iso[["percent.mt"]] <- PercentageFeatureSet(AST23iso, pattern = "^MT-")
+AST23iso <- subset(AST23iso, subset = percent.mt < 20) 
+
+```
+
+Seurat Integration 
+
+    Seurat's Integration: tries to account for technical variation between the two sets, mapping similar cells between the two to each other. Data integration process will return a matrix with "batch-corrected" values. Performes integration analysis for the dimensional analysis and clustering to identify and compare cell types.Use when trying to align cell states that are shared across datasets for clustering, visualization, learning pseudotimes, etc).
+
+    Seurat v4 includes a set of methods to match (or ‘align’) shared cell populations across datasets. These methods first identify cross-dataset pairs of cells that are in a matched biological state (‘anchors’), can be used both to correct for technical differences between datasets (i.e. batch effect correction), and to perform comparative scRNA-seq analysis of across experimental conditions.
+
+Setup the Seurat objects 
+
+    merge() creates a combined Seurat object. This will allow us to split Seurat object with SplitObject() into a list of subsetted objects based on a single attribute (i.e., identity). For example, useful for taking an object that contains cells from many patients, and subdividing it into patient-specific objects. 
+    
+    FindVariableFeatures() identified features that are outliers on the mean variability plot. nfeatures	= number of features to select as top variable features; only used when selection.method is set to 'dispersion' or 'vst'.
+
+    SelectIntegrationFeatures() choose the features to use when integrating multiple datasets. This function ranks features by the number of datasets they are deemed variable in, breaking ties by the median variable feature rank across datasets. It returns the top scoring features by this ranking.
+    
+```{r}
+
+# Merge two datasets 
+
+MBO <- merge(AST23, y=AST23iso, add.cell.ids = c("AST23","Isogenic"))
+
+# Split merged dataset into a list of two Seurat objects (AST23 and Isogenic)
+
+MBO.list <- SplitObject(MBO, split.by = "ident")
+
+# Normalize and identify variable features for each dataset independently. 
+# Seurat expects individual datasets to be normalized prior to integration. 
+
+MBO.list <- lapply(X= MBO.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 5000)
+})
+
+# Select features that are repeatdly variable across datasets for integration 
+
+features <- SelectIntegrationFeatures(object.list = MBO.list, nfeatures = 5000)
+
+```
+
+Perform integration 
+
+    Identify anchors (i.e., matched biological state) between datasets based on top common variable features using the FindIntegrationAnchors() function, which takes a list of Seurat objects as input, and use these anchors to integrate the two datasets together with IntegrateData().
+    
+    IntegradeData() performs dataset integration using a pre-computed AnchorSet object generated by FindIntegrationAnchors().
+
+```{r}
+
+# FInd anchors
+
+MBO.anchors <- FindIntegrationAnchors(object.list = MBO.list, anchor.features = features)
+
+# Create an 'integrated' (i.e. batch-corrected) data assay in a Seurat object, which allows us to run a single integrated analysis in downstream steps. 
+# NB: unmodified data still resides in the 'RNA' assay and is used for DGE analysis.
+
+MBO.combined <- IntegrateData(anchorset = MBO.anchors) 
+# 'Integrated' (batch-corrected data) and 'RNA' (unmodified) assays are stored in this Seurat object. 
+```
+
+Perform the integrated analysis - clustering 
+
+    FindNeighbors(): (Shared) Nearest-neighbor graph construction - computes the k.param nearest neighbors (number of nearest neighbors of datapoints) for a given dataset. Can also optionally (via compute.SNN), construct a shared nearest neighbor graph by calculating the neighborhood overlap (Jaccard index) between every cell and its k.param nearest neighbors.
+
+    FindClusters(): Cluster Determination - dentifies clusters of cells by a shared nearest neighbor (SNN) modularity optimization based clustering algorithm. First calculate k-nearest neighbors and construct the SNN graph. Then optimize the modularity function to determine clusters. Returns a Seurat object where the idents       have been updated with new cluster info; latest clustering results will be stored in object metadata under 'seurat_clusters'. Note that 'seurat_clusters' will be  overwritten everytime FindClusters() is run.
+
+    clustree (Plot a clustering tree) creates a plot of a clustering tree showing the relationship between clusterings at different resolutions.
+    
+```{r}
+# Specify that we will perform downstream analysis on the batch-corrected 'integrated' data. 
+
+DefaultAssay(MBO.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+
+MBO.combined <- ScaleData(MBO.combined, verbose = FALSE)
+MBO.combined <- RunPCA(MBO.combined, npcs = 25, verbose = FALSE) 
+  # Number of PCA was chosen from Elbow plot 
+MBO.combined <- RunUMAP(MBO.combined, reduction = "pca", dims = 1:25)
+
+# Set k.param for SNN to be close to the square root of the number of starting cells (i.e. 4000) 
+
+MBO.combined <- FindNeighbors(MBO.combined, reduction = "pca", dims = 1:25, k.param = 63)
+
+# Set resolution to 1.8 to obtain 15 clusters ???
+MBO.combined <- FindClusters(MBO.combined, resolution = 1.8)
+# MBO.combined object metadata contains "seurat_clusters" that will be used for other cluster annotation tools
+
+clustree(MBO.combined, prefix = "integrated_snn_res.") + theme(legend.position = "bottom")
+  # The higher resolution just splits the neural population into subgroups - type of neurons 5 groups and neural stem cells NPC and neural plate split at lower resolutions.  
+
+```
+
+Visualize the results
+
+```{r}
+DimPlot(MBO.combined, reduction = "umap", group.by = "orig.ident")
+DimPlot(MBO.combined, reduction = "umap", repel = TRUE, label = TRUE, group.by = "integrated_snn_res.1.8")
+
+```
+
+Save this integrated object for future reference
+
+```{r}
+
+saveRDS(MBO.combined,file = "CombinedIntegrated_1.8.rds")
+
+MBO.combined <- readRDS("CombinedIntegrated_1.8.rds")
+
+```
+
+
+
+
+Cluster annotation (i.e., identify cell types):
+
+1) SingleR
+
+  Reference: Normalized expression values for 713 microarray samples from the Human Primary Cell Atlas (HPCA) (Mabbott et al., 2013)
+
+2) ClustifyR
+  
+  Reference datasets: 
+  
+  2.1) ref_cortex_dev  from "clustifyrdatahub"
+  Nowakowski et al Science 2017
+  
+  2.2) adult brain from Hemburge lab 
+  Lake et al. (2016) Neuronal subtypes and diversity revealed by single-nucleus RNA sequencing of the human brain. Science. 352 (6293): 1586-1590
+
+  2.3) fetal brain from Hemburge lab 
+
+
+3) scCATCH
+
+
+4) Seurat' Identify Markers 
+
+
+
+    1) SingleR, Reference-Sased scRNA-seq Annotation
+
+
+    "SingleR" performs unbiased cell type recognition from single-cell RNA sequencing data, by leveraging reference transcriptomic datasets of pure cell types to infer the cell of origin of each single cell independently. Returns the best annotation for each cell in a test dataset, given a labelled reference dataset in the same feature space. 
+    This function is just a convenient wrapper around trainSingleR and classifySingleR.
+
+    "scRNAseq-package" {scRNAseq} is a gene-level counts for a collection of public scRNA-seq datasets, provided as SingleCellExperiment objects with cell- and gene-level metadata. To view documentation for the version of this package installed in your system, start R and enter: browseVignettes("scRNAseq") 
+
+    listDatasets{scRNAseq} ;list all available datasets in the scRNAseq package.
+    
+```{r}
+
+# Install 
+
+BiocManager::install("SingleR")
+BiocManager::install("scRNAseq")
+
+library("SingleR")
+library("scRNAseq") 
+
+```
+
+Load reference dataset
+
+    The easiest way to use SingleR is to annotate cells against built-in references. In particular, the celldex package provides access to several reference datasets (mostly derived from bulk RNA-seq or microarray data) through dedicated retrieval functions. Here, we will use the Human Primary Cell Atlas (Mabbott et al. 2013), represented as a SummarizedExperiment object containing a matrix of log-expression values with sample-level labels.
+    
+    "celldex" provides a collection of reference expression datasets with curated cell type labels, for use in procedures like automated annotation of single-cell data or deconvolution of bulk RNA-seq.
+
+    HumanPrimaryCellAtlasData() provides normalized expression values of the data stored in the Human Primary Cell Atlas (HPCA) (Mabbott et al., 2013). The data will be downloaded from ExperimentHub, returning a SummarizedExperiment object for further use.
+
+```{r}
+
+# The following initializes usage of Bioc devel
+
+BiocManager::install(version='devel')
+
+BiocManager::install("celldex")
+
+library(celldex)
+
+# We'll use hpca.se reference to annotate each cell in MBO.combined via the SingleR() function
+
+hpca.se <- HumanPrimaryCellAtlasData()
+
+```
+
+
+Set Seurat object; use normalized count matrix from the Seurat object
+
+    AssayData {SeuratObject}: Get and set assay data
+    General accessor and setter functions for Assay objects. GetAssayData can be used to pull information from any of the expression matrices (eg. “counts”, “data”, or “scale.data”). SetAssayData can be used to replace one of these expression matrices
+    
+```{r}
+
+DefaultAssay(MBO.combined) <- "RNA"
+MBO.combined <- NormalizeData(MBO.combined, normalization.method = "LogNormalize") 
+MBO.combined <- ScaleData(MBO.combined) 
+
+mnc <- GetAssayData(MBO.combined, slot = "scale.data")
+```
+
+
+    SingleR() {SingleR}, Annotate scRNA-seq data; returns the best annotation for each cell in a test dataset, given a labelled reference dataset in the same feature space.
+    This identifies marker genes from the reference and uses them to compute assignment scores (based on the Spearman correlation across markers) for each cell in the test dataset against each label in the reference. The label with the highest score is the assigned to the test cell, possibly with further fine-tuning to resolve closely related labels.
+    # Arguments: clusters = a character vector or factor of cluster identities for each cell in test. If set, annotation is performed on the aggregated cluster profiles, otherwise it defaults to per-cell annotation.
+    
+    Output: each row of the output DataFrame contains prediction results for a single cell. Labels are shown before fine-tuning (first.labels), after fine-tuning (labels) and after pruning (pruned.labels), along with the associated scores.
+    
+    
+Get the SingleR predictions based on the reference data with clusters = NULL
+
+```{r}
+
+pred.MBO <- SingleR(test = mnc, ref = hpca.se, clusters = NULL, assay.type.test=1,
+    labels = hpca.se$label.main)
+
+pred.MBO
+
+# Summarizing the distribution
+table(pred.MBO$labels)
+```
+
+
+Add single cell labels into Seurat
+
+```{r}
+
+MBO.combined[["SingleR.labels.hpca"]] <-pred.MBO$labels
+
+DimPlot(MBO.combined, reduction = "umap", repel = TRUE, label = TRUE, group.by = "SingleR.labels.hpca")
+
+```
+Results: 
+A lot of different cell types come up - including the expected neurons
+but many false labels eg T_cells, osteoblasts, smooth_muscle.
+
+
+Get the SingleR predictions based on the reference data with Seurat clusters
+
+```{r}
+
+pred.MBO.c <- SingleR(test = mnc, ref = hpca.se, clusters = MBO.combined@meta.data$seurat_clusters, assay.type.test=1,
+    labels = hpca.se$label.main)
+
+pred.MBO.c@listData$labels
+
+# Summarizing the distribution:
+table(pred.MBO.c$labels)
+```
+Results: 
+The cluster indexes are given above - astrocytes and neurons all match
+with expected clusters. The other cell types do not make sense. The
+epithelial cell group could be correct.
+
+
+
+    2) ClustifyR, Classifier for scRNA-seq Using Cell Clusters. 
+
+    Package designed to aid in classifying cells from single-cell RNA sequencing data using external reference data (e.g., bulk RNA-seq, scRNA-seq, microarray, gene lists). A variety of correlation based methods and gene list enrichment methods are provided to assist cell type assignment.
+
+```{r}
+
+# Install
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("clustifyr")
+
+# Load the package
+
+library("clustifyr")
+
+```
+
+Three reference datasets are examined with ClustifyR:
+
+
+2.1) Use "ref_cortex_dev" dataset from  "clufiyrdatahub" library 
+
+Reference of development human cortex brain samples from Nowakowski et al Science 2017
+
+    "clufiyrdatahub" provides external reference datasets for cell-type assignment with [clustifyr].
+
+    Use ExperimentHub to interact with Bioconductor's ExperimentHub service. Query the instance to discover and use resources that are of interest, and then easily download and import the resource into R for immediate use. Use ExperimentHub() to retrieve information about all records in the hub. 
+    
+```{r}
+
+# Install 
+BiocManager::install("clustifyrdatahub")
+
+#library(ExperimentHub)
+eh <- ExperimentHub()
+
+# Load brain development library 
+refs <- query(eh, "clustifyrdatahub")
+refs
+
+ref_brain <- refs[[8]]
+
+```
+
+Direct handling of Seurat object
+
+    clustify{clustifyr} compares scRNA-seq data to reference data to automatically annotate single cells or clusters (i.e., identify cell types).
+    clustifyr can also use a Seurat object as input and return a new Seurat object with the cell types added as a column in the meta.data.
+
+```{r}
+# Set 'RNA' as default assay
+
+DefaultAssay(MBO.combined) <- "RNA"
+MBO.combined <- FindVariableFeatures(MBO.combined, nfeatures = 2000)
+
+res <- clustify( MBO.combined, 
+                 ref_mat = ref_brain,
+                 cluster_col = "seurat_clusters", #MBO.combined metadata after running 
+                 seurat_out = TRUE
+)
+
+#check the correlation matrix
+res@meta.data$type[1:10] # the output is the in 'type' column
+
+# try to visualize
+DimPlot(res, reduction = "umap", repel = TRUE, label = TRUE, group.by = "type")
+```
+
+Results:
+There is one cluster assigned as astrocytes. 
+There are two groups of radial glia, a dividing group and oRG (outer radial glia). 
+The neurons are assigned as Glyc (cell undergoing glycolysis) and EN-PFC2 (Early and Late Born Excitatory Neurons).
+Some of the glia and the other cells that could be epithelial and endothelial cells are not assigned (see final annotation). The is endothelial but not epithelial cells in the reference data.
+
+
+2.2) Use "adult brain" from Lake et al. (2016)
+
+```{r}
+
+# Load Lake reference dataset
+
+lake <- readRDS("../MBO_scRNAseq-main/reference datasets/scRNA.seq.datasets-master/R/lake.rds") # update ???
+
+# Make reference matrix
+# Convert labelled object to avg expression matrix with object_ref{clysifyr}.
+
+sce_ref_lake <- object_ref(
+  input = lake,               # SCE object
+  cluster_col = "cell_type1"       # name of column in colData containing cell identities
+)
+
+```
+
+Direct handling of Seurat object
+
+```{r}
+
+res.lake <- clustify( MBO.combined, 
+                 ref_mat = sce_ref_lake,
+                 cluster_col = "seurat_clusters",
+                 seurat_out = TRUE
+)
+
+DimPlot(res.lake, reduction = "umap", repel = TRUE, label = TRUE, group.by = "type")
+```
+
+Results: 
+The neurons are all labeled as two subgroups of inhibitory neurons and
+all the other cells are unknown.
+
+
+2.3) Use "feta brain" from Manno et al. 
+
+```{r}
+
+# Load Manno reference dataset
+
+manno <- readRDS("../MBO_scRNAseq-main/reference datasets/scRNA.seq.datasets-master/R/manno_human.rds") # update ???
+
+# Make reference matrix
+# Convert labelled object to avg expression matrix with object_ref{clysifyr}.
+
+sce_ref_manno <- object_ref(
+  input = manno,               # SCE object
+  cluster_col = "cell_type1"       # name of column in colData containing cell identities
+)
+
+```
+
+Direct handling of Seurat object
+
+```{r}
+
+res.manno <- clustify( MBO.combined, 
+                 ref_mat = sce_ref_manno,
+                 cluster_col = "seurat_clusters",
+                 seurat_out = TRUE,
+                 n_genes = 2000
+)
+
+DimPlot(res.manno, reduction = "umap", repel = TRUE, label = TRUE, group.by = "type")
+```
+
+Results: 
+All glia are assigned as different types of radial glia. The neurons are all assigned as either neurons or neural progenitors although inhibitory.
+    
+
+    3) scCATCH: from cluster marker genes identification to cluster annotation 
+
+    Evidence-based score and annotation for each cluster by matching the potential marker genes generated from findmarkergenes with known cell marker genes in tissue-specific cell taxonomy reference database (CellMatch).
+
+```{r}
+
+# Install devtools and scCATCH
+
+install.packages(pkgs = 'devtools')
+devtools::install_github('ZJUFanLab/scCATCH')
+
+# Load library
+
+library("scCATCH")
+```
+
+Set Seurat object; requires log expression values  
+
+    findmarkergenes: Find potential marker genes for each cluster
+    Identify potential marker genes for each cluster from a Seurat object (>= 3.0.0) after log1p normalization and cluster analysis. The potential marker genes in each cluster are identified according to its expression level compared to it in every other clusters. Only significantly highly expressed one in all pair-wise comparison of the cluster will be selected as a potential marker gene for the cluster. Genes will be revised according to NCBI Gene symbols (updated in Jan. 10, 2020, https://www.ncbi.nlm.nih.gov/gene) and no matched genes and duplicated genes will be removed. 
+    
+```{r}
+
+DefaultAssay(MBO.combined) <- "RNA"
+
+# Log Normalize is the default
+MBO.combined <- NormalizeData(MBO.combined, verobse =TRUE)
+
+# Get the cluster markers genes
+
+clu_markers <- findmarkergenes(MBO.combined, species = "Human")
+  # This process is extremely slow (approximately 4 hours)
+
+# save the data object
+saveRDS(clu_markers, "scCATCH_markers_14clusters.rds")
+
+clu_markers <- scCATCH_markers_14clusters
+```
+
+Use markers found with scCATCH to annotate Seurat clusters
+
+```{r}
+
+clu_ann <- scCATCH(object = clu_markers$clu_markers, species = 'Human', tissue = c("Brain","Midbrain","Fetal brain","Embryonic brain","Sympathetic ganglion"))
+
+clu_ann
+
+```
+
+Results: 
+Clusters are astrocyte, oligodendrocyte neurons and unknown.
+
+
+    4) Seurat Identity Markers
+
+    FindAllMarkers finds gene markers (differentially expressed genes) for each of the identity classes in a dataset.
+    # Arguments: test.use: 
+    
+    "wilcox": Identifies differentially expressed genes between two groups of cells using a Wilcoxon Rank Sum test (default)
+    
+    "MAST": Identifies differentially expressed genes between two groups of cells using a hurdle model tailored to scRNA-seq data. Utilizes the MAST package to run the DE testing 
+
+
+Find clusters and gene markers at resolution 1.8 See 'getclusters' script for identifying cell types for each resolution (slow).
+```{r}
+
+DefaultAssay(MBO.combined) <- "integrated"
+i = 1.8
+
+MBO.combined <- FindClusters(MBO.combined, resolution = i)
+DefaultAssay(MBO.combined) <- "RNA"
+# I want to get the cluster markers from the RNA not just the values used for integration
+ClusterMarkers <- FindAllMarkers(MBO.combined, logfc.threshold = 0.1, return.thresh = 0.05, only.pos = TRUE)
+top20 <-ClusterMarkers %>% group_by(cluster) %>% top_n(n=20, wt = avg_log2FC)
+top5 <- ClusterMarkers %>% group_by(cluster) %>% top_n(n=5, wt = avg_log2FC)
+#
+save all the positive markers
+write.csv(ClusterMarkers, "SClusterMarkersPos21072021-res1.8.csv")
+# save the top 20 positive markers
+write.csv(top20, "SClusterMarkersTOP20_Pos21072021-res1.8.csv")
+
+# Need to scale the data in the RNA slot to visualize 
+MBO.combined <- ScaleData(MBO.combined, verbose = FALSE)
+
+# Plot the expression of the top 5 markers
+DoHeatmap(MBO.combined, features = top5$gene, group.by = "integrated_snn_res.1.8") + NoLegend()
+
+# make heat map of selected markers
+feature_list = c("DLX2","SOX2","PAX6","SOX9","HES1","ITGA6","MAP2","NCAM1","CD24","GRIA2","GRIN2B","GABBR1","TH","CORIN","CALB1","KCNJ6","CXCR4","ITGA6","NES","SLC1A3","CD44","AQP4","S100B","GFAP","ALDH1L1","EAAT1","EAAT2", "PDGFRA","CLDN11","VIM","VCAM1")
+ft2 = c("ACE2","ACE1","SOX9","HES1","ITGA6","MAP2","NCAM1","CD24","GRIA2","GRIN2B","GABBR1","TH","CORIN","CALB1","KCNJ6","CXCR4","ITGA6","NES","SLC1A3","CD44","AQP4","S100B", "PDGFRA","CLDN11","VIM","VCAM1")
+
+png("HeatMapMarkerlistres1.8.png")
+DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = feature_list)
+dev.off()
+```
+
+Look at expression of known cell types markers across clusters
+
+```{r}
+
+# Set neuronal markers
+
+neurons <- c("MAP2","GRIA1","GRIA2","GRIA3","GRIA4","GRIN1","GRIN2B","GRIN2A","GRIN3A","CAMK2A","DLX2","CD24","SYPL1","SYPL2","VAMP2","NTRK1","NTRK2","NTRK3","SATB2","TBR1","TUBB3","RBFOX3","DCX","SYP","GAD1","GAD2","GABRA1","GABRB2","RYR2","NEUROD6","STMN2","NRN1")
+neuron2 <- c("NPY","SST","SNAP25","VIP","SCG2","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4") # from McKenzie et al
+
+# Visualize neurons markers
+
+neurons_DotPlot <- DotPlot(MBO.combined, features = neurons) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Neuronal Marker Expression")
+neurons_DotPlot
+
+neurons_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = neurons) + ggtitle("Neuronal Marker Expression")
+neurons_DoHeatmap
+
+# Visualize neuron2 marker expression 
+
+neuron2_DotPlot <- DotPlot(MBO.combined, features = neuron2) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Neuronal Marker Expression new")
+neuron2_DotPlot
+
+neuron2_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = neuron2) + ggtitle("Neuronal Marker Expression new")
+neuron2_DoHeatmap
+```
+
+```{r}
+# Set neural stem cell markers
+
+neural.stem <- c("NEUROD", "MSX1", "SSEA1","ASCL1")
+
+# Visualize neural stem cell expression 
+
+neural.stem_DotPlot <- DotPlot(MBO.combined, features = neural.stem) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Neuronal Stem Cell Marker Expression")
+neural.stem_DotPlot
+```
+
+#
+```{r}
+
+# Set GABAergic markers
+
+GABA <- c("GAD1","GAD2","GABRA1","GABRB2","RYR2")
+
+# Visualize inhibitory cell expression 
+GABA_DotPlot <- DotPlot(MBO.combined, features = GABA) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Inhibitory Marker Expression")
+GABA_DotPlot
+
+```
+
+```{r}
+
+# Set DA markers
+
+DaN <- c("TH","LMX1B","KCNJ6","NR4A2","SLC6A3","CALB1","CALB2","DRD2","DAT", "PITX3","CORIN","DRD1","DRD2","DRD4","DRD5","FOXA2","LIMX1A","OTX2","RPS6KA5","NOG","NR4A1","WNT1","EN1","EN2","CPNY1","FOLR1","DMRTA2")
+
+# from the Human cell Landscape viewer LaManno
+DaN <- c("ALDH1A1","NR4A2","PBX1","CAMK2N1","TMCC3","EN1","ANK3","GAP43","CELF4","SLC18A2","TMEFF2","RTN1","GRIA3","STMN2")
+
+# Visualize 
+
+DA_DotPlot <- DotPlot(MBO.combined, features = DaN) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Dopaminergic Neuron and Precursor Marker Expression")
+DA_DotPlot
+
+DA_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = DaN) + ggtitle("Dopaminergic Neuron and Precursor Marker Expression")
+DoHeatmap(MBO.combined, features = DaN) + ggtitle("Dopaminergic Neuron and Precursor Marker Expression")
+
+DA_VlnPlot <- VlnPlot(MBO.combined, features =c("TH","NR4A2")) + ggtitle("Dopaminergic neurons")
+DA_VlnPlot
+
+```
+
+```{r}
+
+# Set astrocyte markers
+
+astrocyte <- c("AQP4","S100B","SLC1A3","SLC1A2","CPE","CLU","ADGRV1","CLDN10","ETNPPL","PRSS35","RNF219-AS1","STON2","TPD52L1","ALDH1L-1","GFAP")
+pAstro <- VlnPlot(AST23, features = astrocyte)
+pAstro
+
+# Set radial glial markers
+
+RG <- c("FAM60A","MTM1","SFRP1","SLC1A3","RSF1","ZNF844","ME152","RBM6","DLK1","EMX2","TTYH1","HES1","HSPA1B","HSPA1A","SOX2","HOPX","GLAST","VIM","CD44")
+  # note SLC1A3 is GLAST
+
+RG_DotPlot <- DotPlot(MBO.combined, features = RG) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Radial Glial all types Marker Expression")
+RG_DotPlot
+RG_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = RG, size=4, angle =90, group.bar.height = 0.05) + ggtitle("Radial Glial all types Marker Expression")
+RG_DoHeatmap
+
+# Set oligodendrocyte  markers
+
+oligodendrocyte <- c("PLP1","CNP","MAL","MOG","CRYAB", "ANLN","CARNS1","CLCA4", "CTNNA3","PAIP2B","QDPR","SLAIN1","SOX2-OT","TMEM144", "OLIG1","OLIG2","FTH1")
+
+oligodendrocyte_DotPlot <- DotPlot(MBO.combined, features = oligodendrocyte) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Oligodendrocyte Marker Expression")
+oligodendrocyte_DotPlot
+oligodendrocyte_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = oligodendrocyte, size=4, angle =90, group.bar.height = 0.05) + ggtitle("Oligodendrocyte Marker Expression")
+oligodendrocyte_DoHeatmap 
+
+
+```
+
+```{r}
+
+# Set endothelial  markers 
+
+endothelial <- c("APOLD1","ITM2A","BSG","IFITM1","RSG5","")
+
+endothelial_DotPlot <- DotPlot(MBO.combined, features = endothelial) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("Endothelial Marker Expression")
+endothelial_DotPlot
+endothelial_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = endothelial, size=4, angle =90, group.bar.height = 0.05) + ggtitle("endothelial Marker Expression")
+endothelial_DoHeatmap 
+
+# Set microglial markers 
+microglia <- c("CCL4","CCL3","CTSS","TYROBP","CD83")
+
+microglia_DotPlot <- DotPlot(MBO.combined, features = microglia) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("microglia Marker Expression")
+microglia_DotPlot
+microglia_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = microglia, size=4, angle =90, group.bar.height = 0.05) + ggtitle("microglia Marker Expression")
+microglia_DoHeatmap 
+
+# Set ependymal  markers 
+ependymal <- c("FOXJ1")
+
+ependymal_DotPlot <- DotPlot(MBO.combined, features = ependymal) + theme(axis.text.x = element_text(angle = 90)) + ggtitle("ependymal Marker Expression")
+ependymal_DotPlot
+ependymal_DoHeatmap <- DoHeatmap(MBO.combined, group.by = "seurat_clusters", features = ependymal, size=4, angle =90, group.bar.height = 0.05) + ggtitle("ependymal Marker Expression")
+ependymal_DoHeatmap 
+```
+
+Name clusters based on looking at top markers compared to expression databases UCSC, Single Cell Landscape and DEG published.
+
+Combine Cluster 2 and 3 - they are both more mature neurons that contain both excitatory and inhibitory neurons - they may be interesting for later but for our purposes these can be merged. Also merge 10 and 12 the two clusters containing the most DA marker expression.
+
+Do not merge the Radial Glia because they are all different from each other.
+
+
+    Cluster Annotation 
+
+These are final cluster annotation examiend by Rhalena. Clusters in this notebook are different, so need to be investigated separately. 
+Revise later ???
+
+0 Astroctye 
+1 RG-a 
+2 Neuron 
+3 Neuron 
+4 Astrocyte-i 
+5 Epithelial 
+6 Oligodendrocyte 
+7 Neuron-inh 
+8 Neuron-exc 
+9 RG-d1 
+10 Neuron-DA 
+11 Other
+12 Neuron-DA 
+13 RG-d2 
+14 Neural Precursors
+    
+Rename clusters and look at expression plus markers
+
+```{r}
+
+Idents(MBO.combined) <- "seurat_clusters"
+# Get, set, and manipulate an object's identity classes
+
+cluster.id <- c("Astrocytes-1","RGa","Neurons","Neurons","Astrocytes-2","Epithelial","Oligodendrocytes","Neurons-i","Neurons-e","RGd1","Neurons-DA","Other","Neurons-DA","RGd2","Neural Precursors")
+
+# apply the cluster names
+names(cluster.id) <- levels(MBO.combined)
+
+# rename cluster in active.ident
+MBO.combined <- RenameIdents(MBO.combined, cluster.id)
+
+# save the names for later in metadata
+MBO.combined$cluster_labels <- Idents(MBO.combined)
+saveRDS(MBO.combined,"MBOcombinedClusterNames.rds")
+MBO.combined <- readRDS("MBOcombinedClusterNames.rds")
+
+colours = c("#5AC896", # astro 1 green
+            "#2A939F", # RGa blue
+            "#8AD8B9", # Neurons - 
+            "#2A913F", # Astro -2
+            "#9960C5", # epi
+            "#C05862", # oligo
+            "#D6AA75", # Neur i beige
+            "#E6B6A1", # Neur e
+            "#C970A1", # RGd1
+            "#ACCD4A", # Neurons-DA
+            "grey", # Other grey 
+            "#2A73A5", # RGd2
+            "#BD5D44") # NPC
+
+#names(cluster.id) <- levels(MBO.combined)
+#MBO.combined <- RenameIdents(MBO.combined, cluster.id)
+DimPlot(MBO.combined, reduction = "umap", label = TRUE, label.size = 4.5, pt.size = 0.5, cols = colours, repel = TRUE) + NoLegend()
+
+# save the plot
+# tiff - Graphics devices for BMP, JPEG, PNG and TIFF format bitmap files.
+
+tiff("UMAP_labelledClustersMBO.tiff", units = "in", width = 6, height = 5, res=300)
+DimPlot(MBO.combined, reduction = "umap", label = TRUE, label.size = 5, pt.size = 0.5, cols = colours, repel = TRUE) + NoLegend()
+dev.off()
+
+# without the labels
+png("UMAP_labelledClustersMBO-noLab_legend.png")
+DimPlot(MBO.combined, reduction = "umap", label = FALSE, label.size = 4.5, pt.size = 0.5, cols = colours, repel = TRUE)
+dev.off()
+
+# without labels or legend
+png("UMAP_labelledClustersMBO-noLab.png")
+DimPlot(MBO.combined, reduction = "umap", label = FALSE, label.size = 4.5, pt.size = 0.5, cols = colours, repel = TRUE)  + NoLegend()
+dev.off()
+```
+
+
+Compare AST23 to control
+
+```{r}
+
+DimPlot(MBO.combined,split.by = "orig.ident",pt.size = 0.5, label= TRUE, repel = TRUE, label.size = 3, cols = colours) + NoLegend()
+
+# save an image
+tiff("UMAP_split_clusters.tiff", units = "in", width = 12, height = 5, res=300)
+DimPlot(MBO.combined,split.by = "orig.ident",pt.size = 0.5, label= TRUE, repel = TRUE, label.size = 3, cols = colours) + NoLegend()
+dev.off()
+```
